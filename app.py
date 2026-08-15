@@ -60,6 +60,10 @@ TEST_DATA_PATH = PROJECT_ROOT / "test_data.csv"
 COMPARISON_TABLE_PATH = RESULTS_DIR / "comparison_table.csv"
 SCALER_PATH = MODEL_DIR / "scaler.joblib"
 FEATURE_NAMES_PATH = MODEL_DIR / "feature_names.joblib"
+NUM_IMPUTER_PATH = MODEL_DIR / "num_imputer.joblib"
+CAT_IMPUTER_PATH = MODEL_DIR / "cat_imputer.joblib"
+NUMERIC_COLS_PATH = MODEL_DIR / "numeric_cols.joblib"
+CATEGORICAL_COLS_PATH = MODEL_DIR / "categorical_cols.joblib"
 
 MODEL_FILES = {
     "Logistic Regression": MODEL_DIR / "logistic_regression.joblib",
@@ -100,6 +104,21 @@ def load_scaler_and_features():
     scaler = joblib.load(SCALER_PATH) if SCALER_PATH.exists() else None
     feature_names = joblib.load(FEATURE_NAMES_PATH) if FEATURE_NAMES_PATH.exists() else None
     return scaler, feature_names
+
+
+@st.cache_resource(show_spinner=False)
+def load_imputers():
+    """
+    Load the fitted numeric/categorical imputers (and the raw column lists
+    each applies to), so raw uploads with missing values (e.g. missing
+    'ca'/'thal', common in this dataset) are imputed EXACTLY like the
+    training data was, instead of passing NaNs straight to the model.
+    """
+    num_imputer = joblib.load(NUM_IMPUTER_PATH) if NUM_IMPUTER_PATH.exists() else None
+    cat_imputer = joblib.load(CAT_IMPUTER_PATH) if CAT_IMPUTER_PATH.exists() else None
+    numeric_cols = joblib.load(NUMERIC_COLS_PATH) if NUMERIC_COLS_PATH.exists() else []
+    categorical_cols = joblib.load(CATEGORICAL_COLS_PATH) if CATEGORICAL_COLS_PATH.exists() else []
+    return num_imputer, cat_imputer, numeric_cols, categorical_cols
 
 
 @st.cache_data(show_spinner=False)
@@ -184,10 +203,18 @@ def render_classification_report(y_true, y_pred) -> None:
     st.dataframe(report_df.style.format("{:.4f}"), use_container_width=True)
 
 
-def encode_and_scale_raw(df: pd.DataFrame, feature_names: list, scaler) -> pd.DataFrame:
+def encode_and_scale_raw(
+    df: pd.DataFrame,
+    feature_names: list,
+    scaler,
+    num_imputer=None,
+    cat_imputer=None,
+    numeric_cols: Optional[list] = None,
+    categorical_cols: Optional[list] = None,
+) -> pd.DataFrame:
     """
-    Apply the exact same encoding/scaling used during training to a batch
-    of RAW (unencoded) uploaded records, and align columns to the
+    Apply the exact same imputation/encoding/scaling used during training to
+    a batch of RAW (unencoded) uploaded records, and align columns to the
     training-time feature order.
 
     Parameters
@@ -197,6 +224,12 @@ def encode_and_scale_raw(df: pd.DataFrame, feature_names: list, scaler) -> pd.Da
     feature_names : list[str]
         Column order the model/scaler were trained on.
     scaler : fitted StandardScaler
+    num_imputer, cat_imputer : fitted SimpleImputer or None
+        Imputers fitted during training (see utils.preprocess_data). If
+        None, missing values are left as-is (will raise downstream if any
+        remain — safer than silently guessing a fill value).
+    numeric_cols, categorical_cols : list[str] or None
+        The exact raw column lists the imputers were fitted on.
 
     Returns
     -------
@@ -205,9 +238,21 @@ def encode_and_scale_raw(df: pd.DataFrame, feature_names: list, scaler) -> pd.Da
     """
     df = df.copy()
 
+    # --- Impute missing values EXACTLY as done during training ---
+    if num_imputer is not None and numeric_cols:
+        present_numeric = [c for c in numeric_cols if c in df.columns]
+        if present_numeric:
+            df[present_numeric] = num_imputer.transform(df[present_numeric])
+
+    if cat_imputer is not None and categorical_cols:
+        present_categorical = [c for c in categorical_cols if c in df.columns]
+        if present_categorical:
+            df[present_categorical] = cat_imputer.transform(df[present_categorical])
+
+    # --- Encode ---
     for col in BINARY_RAW_COLUMNS:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype(int)
 
     present_multi_cat = [c for c in MULTI_CAT_RAW_COLUMNS if c in df.columns]
     if present_multi_cat:
@@ -228,6 +273,51 @@ def extract_target(df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[pd.Series]]
             X = df.drop(columns=[candidate])
             return X, y
     return df, None
+
+
+def prepare_features_for_prediction(
+    features_df: pd.DataFrame,
+    feature_names: list,
+    scaler,
+    num_imputer=None,
+    cat_imputer=None,
+    numeric_cols: Optional[list] = None,
+    categorical_cols: Optional[list] = None,
+):
+    """
+    Prepare an uploaded features dataframe for `.predict()`, auto-detecting
+    whether the upload is:
+      * ALREADY processed (scaled + one-hot encoded, i.e. it already
+        contains all of the training-time `feature_names` columns — e.g.
+        someone re-uploads the project's own `test_data.csv`) -> used as-is.
+      * RAW (the original 13 clinical columns, possibly with missing
+        values, unscaled/unencoded) -> imputed, encoded, and scaled with
+        `encode_and_scale_raw`.
+
+    Returns
+    -------
+    tuple
+        (X_ready, mode) where mode is "processed" or "raw", or
+        (None, "missing_columns") if neither format matches.
+    """
+    if set(feature_names).issubset(set(features_df.columns)):
+        # Already matches the trained feature set (scaled + encoded) — use directly.
+        return features_df[feature_names].reset_index(drop=True), "processed"
+
+    missing_raw_cols = [c for c in RAW_FEATURE_COLUMNS if c not in features_df.columns]
+    if not missing_raw_cols:
+        X_ready = encode_and_scale_raw(
+            features_df[RAW_FEATURE_COLUMNS],
+            feature_names,
+            scaler,
+            num_imputer=num_imputer,
+            cat_imputer=cat_imputer,
+            numeric_cols=numeric_cols,
+            categorical_cols=categorical_cols,
+        )
+        return X_ready, "raw"
+
+    return None, "missing_columns"
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +446,7 @@ def render_upload_predict_section(model_name: str, uploaded_file, predict_clicke
 
     model = load_model(model_name)
     scaler, feature_names = load_scaler_and_features()
+    num_imputer, cat_imputer, numeric_cols, categorical_cols = load_imputers()
 
     if model is None or scaler is None or feature_names is None:
         st.warning(
@@ -366,15 +457,51 @@ def render_upload_predict_section(model_name: str, uploaded_file, predict_clicke
 
     features_df, y_true = extract_target(raw_df)
 
-    missing_cols = [c for c in RAW_FEATURE_COLUMNS if c not in features_df.columns]
-    if missing_cols:
-        st.error(f"Uploaded CSV is missing required columns: {missing_cols}")
+    is_already_processed = set(feature_names).issubset(set(features_df.columns))
+    is_raw_format = all(c in features_df.columns for c in RAW_FEATURE_COLUMNS)
+    has_missing_raw_values = (
+        is_raw_format
+        and not is_already_processed
+        and features_df[RAW_FEATURE_COLUMNS].isnull().any().any()
+    )
+    if has_missing_raw_values and (num_imputer is None or cat_imputer is None):
+        st.warning(
+            "This upload has missing values, but no saved imputer artifacts "
+            "were found (they were added in a later version of this "
+            "pipeline). Re-run 'python train_models.py' (or the notebooks) "
+            "to regenerate model/num_imputer.joblib and "
+            "model/cat_imputer.joblib, then try again."
+        )
         return
 
+    X_ready, mode = prepare_features_for_prediction(
+        features_df, feature_names, scaler,
+        num_imputer=num_imputer, cat_imputer=cat_imputer,
+        numeric_cols=numeric_cols, categorical_cols=categorical_cols,
+    )
+
+    if mode == "missing_columns":
+        missing_raw_cols = [c for c in RAW_FEATURE_COLUMNS if c not in features_df.columns]
+        st.error(
+            "Uploaded CSV doesn't match either expected format.\n\n"
+            f"- As RAW patient data, it's missing columns: {missing_raw_cols}\n"
+            "- As already-processed data, it doesn't contain all of the "
+            "model's trained feature columns.\n\n"
+            "Upload a CSV with the 13 raw clinical columns (age, sex, cp, "
+            "trestbps, chol, fbs, restecg, thalch, exang, oldpeak, slope, "
+            "ca, thal), optionally with a 'target' or 'num' column."
+        )
+        return
+
+    if mode == "processed":
+        st.info(
+            "Detected an already-processed (scaled/encoded) upload — using "
+            "it as-is without re-encoding."
+        )
+
     try:
-        X_scaled = encode_and_scale_raw(features_df[RAW_FEATURE_COLUMNS], feature_names, scaler)
-        y_pred = model.predict(X_scaled)
-        y_proba = model.predict_proba(X_scaled)[:, 1] if hasattr(model, "predict_proba") else y_pred
+        y_pred = model.predict(X_ready)
+        y_proba = model.predict_proba(X_ready)[:, 1] if hasattr(model, "predict_proba") else y_pred
     except Exception as exc:
         st.error(f"Prediction failed: {exc}")
         return

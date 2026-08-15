@@ -251,6 +251,9 @@ def preprocess_data(df: pd.DataFrame, test_size: float = 0.2):
         5. Train/test split (80:20, stratified on target, random_state=42).
         6. Standard-scale all features (fit on train, transform on both).
         7. Persist the held-out test set to `test_data.csv` for reproducibility.
+        8. Persist the fitted scaler, imputers, and column metadata to
+           `model/*.joblib` so app.py can apply IDENTICAL preprocessing to
+           new raw CSV uploads at inference time.
 
     Parameters
     ----------
@@ -272,6 +275,9 @@ def preprocess_data(df: pd.DataFrame, test_size: float = 0.2):
                          if c in df.columns]
 
     # --- Handle missing values ---
+    num_imputer = None
+    cat_imputer = None
+
     if numeric_cols:
         num_imputer = SimpleImputer(strategy="median")
         df[numeric_cols] = num_imputer.fit_transform(df[numeric_cols])
@@ -315,6 +321,18 @@ def preprocess_data(df: pd.DataFrame, test_size: float = 0.2):
 
     joblib.dump(scaler, MODEL_DIR / "scaler.joblib")
     joblib.dump(list(X_train_scaled.columns), MODEL_DIR / "feature_names.joblib")
+
+    # Persist the fitted imputers (+ which raw columns each applies to) so
+    # app.py can replicate the EXACT same missing-value handling on new,
+    # raw CSV uploads at inference time. Without this, a raw upload with
+    # missing values (e.g. missing 'ca'/'thal', common in this dataset)
+    # would pass NaNs straight through to the model and fail at predict().
+    if num_imputer is not None:
+        joblib.dump(num_imputer, MODEL_DIR / "num_imputer.joblib")
+    if cat_imputer is not None:
+        joblib.dump(cat_imputer, MODEL_DIR / "cat_imputer.joblib")
+    joblib.dump(numeric_cols, MODEL_DIR / "numeric_cols.joblib")
+    joblib.dump(categorical_cols, MODEL_DIR / "categorical_cols.joblib")
 
     return X_train_scaled, X_test_scaled, y_train, y_test, scaler, list(X_train_scaled.columns)
 
